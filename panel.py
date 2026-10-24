@@ -8,7 +8,6 @@ D = os.path.dirname(os.path.abspath(__file__))
 CFG = json.load(open(os.path.join(D, "config.json")))
 DB = os.path.join(D, "connections.json")
 LOCK = threading.Lock()
-LINK_RE = re.compile(r"openflux://\S+")
 B64_RE = re.compile(r"^[A-Za-z0-9+/]{40,}={0,2}$")
 
 def load():
@@ -46,28 +45,30 @@ WantedBy=multi-user.target
 def logs(i, n=200): return sh("journalctl", "-u", unit(i), "-n", str(n), "--no-pager", "-o", "cat")
 
 def capture(i):
-    """Wait for the node to print openflux:// link / base64 code; save them."""
+    """cups: wait for the node to print the base64 code, store it, next start uses --url=<code>."""
     for _ in range(60):
         time.sleep(2)
         out = logs(i)
-        link = (LINK_RE.findall(out) or [None])[-1]
         b64 = ([l.strip() for l in out.splitlines() if B64_RE.match(l.strip())] or [None])[-1]
         with LOCK:
             db = load(); c = db.get(i)
-            if not c: return
-            if link: c["link"] = link
-            if b64 and not link: c["code_seen"] = b64
-            cups_new = "cupsonline" in " ".join(c["args"]) and not any(x.startswith("--url") for x in c["args"])
-            if cups_new and b64:
-                c["code"] = b64; write_unit(i, c)   # next start uses --url=<code>
-            save(db)
-            if link or (cups_new and b64): return
+            if not c or c.get("code") or any(x.startswith("--url") for x in c["args"]): return
+            if "cupsonline" in " ".join(c["args"]) and b64:
+                c["code"] = b64; save(db); write_unit(i, c); return
+
+def share(c):
+    """What the client needs: the --url the node was started with (telemost etc.) or the cups base64 code."""
+    a = c["args"]
+    for k, x in enumerate(a):
+        if x.startswith("--url="): return x[6:], "Ссылка, с которой запущено"
+        if x == "--url" and k + 1 < len(a): return a[k + 1], "Ссылка, с которой запущено"
+    code = c.get("code") or c.get("code_seen")
+    return (code, "Код (base64)") if code else (None, None)
 
 def view(i, c):
+    v, kind = share(c)
     return {"id": i, "name": c["name"], "args": c["args"], "status": sh("systemctl", "is-active", unit(i)).strip(),
-            "link": c.get("link"), "code": c.get("code") or c.get("code_seen")}
-
-def share_data(c): return c.get("link") or c.get("code") or c.get("code_seen")
+            "share": v, "kind": kind}
 
 PAGE = r"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>OpenFlux</title>
 <style>:root{color-scheme:dark}body{font:15px system-ui;background:#111;color:#eee;max-width:860px;margin:0 auto;padding:16px}
@@ -98,9 +99,8 @@ async function load(){const d=await api('list');q('l').innerHTML=d.map(c=>`<div 
 <button onclick="act('${c.id}','restart')" class=g>Рестарт</button><button onclick="lg('${c.id}')" class=g>Логи</button>
 <button onclick="sh('${c.id}')">Ссылка / QR</button><button onclick="act('${c.id}','delete')" class=r>Удалить</button>
 <pre id=lg${c.id} style="display:none;max-height:260px;overflow:auto"></pre>
-<div id=sh${c.id} style="display:none">${c.link?'<p><b>Ссылка:</b><br><code>'+E(c.link)+'</code></p>':'<p>openflux:// ссылка ещё не получена от узла.</p>'}
-${c.code?'<p><b>Код (base64):</b><br><code>'+E(c.code)+'</code></p>':''}
-${(c.link||c.code)?'<img src="'+B+'api/'+c.id+'/qr.svg?'+Date.now()+'" style="background:#fff;padding:8px;border-radius:8px;width:240px">':''}</div></div>`).join('')||'<p>Подключений пока нет.</p>'}
+<div id=sh${c.id} style="display:none">${c.share?'<p><b>'+E(c.kind)+':</b><br><code>'+E(c.share)+'</code></p><img src="'+B+'api/'+c.id+'/qr.svg?'+Date.now()+'" style="background:#fff;padding:8px;border-radius:8px;width:240px">':'<p>Кода пока нет — узел ещё не вывел его, смотрите «Логи».</p>'}
+</div></div>`).join('')||'<p>Подключений пока нет.</p>'}
 load();setInterval(()=>{if(!document.activeElement||document.activeElement.tagName!='TEXTAREA')load()},8000);
 </script>"""
 
@@ -148,7 +148,7 @@ class H(BaseHTTPRequestHandler):
         a = p[2] if len(p) > 2 else ""
         if a == "logs": return self.out(200, logs(i) or "(пусто)", "text/plain")
         if a == "qr.svg":
-            d = share_data(db[i])
+            d = share(db[i])[0]
             if not d: return self.out(404, "no data", "text/plain")
             buf = io.BytesIO(); qrcode.make(d, image_factory=qrcode.image.svg.SvgPathImage).save(buf)
             return self.out(200, buf.getvalue(), "image/svg+xml")
